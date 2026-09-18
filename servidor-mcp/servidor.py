@@ -333,12 +333,6 @@ def _handle_reservar_sala_retry(params: dict) -> dict:
     except estado.EstadoInvalido as e:
         raise ErroProtocolo(-32602, f"requestState invalido: {e}") from e
 
-    # Token criptograficamente valido: agora redime o jti. Um segundo tools/call
-    # com este mesmo requestState (replay) e recusado a partir daqui, mesmo que
-    # a assinatura e o TTL continuem validos - previne dupla reserva a partir de
-    # um unico conflito.
-    _redimir_jti(payload.get("jti", token))
-
     chave = payload.get("key", CHAVE_ELICITATION)
     respostas = params.get("inputResponses") or {}
     resposta = respostas.get(chave) or next(iter(respostas.values()), None)
@@ -347,6 +341,13 @@ def _handle_reservar_sala_retry(params: dict) -> dict:
 
     acao = resposta.get("action")
     if acao in ("decline", "cancel"):
+        # So redime o jti no ponto do efeito colateral (aqui, ou antes de
+        # criar_reserva mais abaixo). Um tools/call mal formado (chave errada,
+        # action invalida, sala fora do enum) nao gasta o token: o cliente pode
+        # corrigir e reapresentar o mesmo requestState. So a partir daqui um
+        # segundo tools/call com este requestState (replay) e recusado, mesmo
+        # que a assinatura e o TTL continuem validos.
+        _redimir_jti(payload.get("jti") or token)
         structured = {
             "reserva": None,
             "reservado": False,
@@ -366,6 +367,8 @@ def _handle_reservar_sala_retry(params: dict) -> dict:
     alternativas = payload.get("alternativas") or []
     if escolhida not in alternativas:
         raise ErroProtocolo(-32602, "sala escolhida nao esta entre as alternativas seladas no requestState")
+
+    _redimir_jti(payload.get("jti") or token)
 
     # Os argumentos que o cliente reenviou nao sao confiaveis: o pedido original
     # e reconstruido inteiramente a partir do que foi selado no requestState.

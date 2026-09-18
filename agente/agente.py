@@ -406,7 +406,7 @@ class Handler(BaseHTTPRequestHandler):
             # sem resposta JSON-RPC nenhuma (isso deixaria o cliente A2A sem
             # confirmacao alguma do que aconteceu com a Task).
             print(f"[agente] erro nao tratado em {metodo}: {e}", file=sys.stderr, flush=True)
-            self._responder(200, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32603, "message": f"erro interno: {e}"}})
+            self._responder(200, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32603, "message": "erro interno"}})
 
     def _responder(self, status: int, corpo: dict) -> None:
         dados = json.dumps(corpo).encode("utf-8")
