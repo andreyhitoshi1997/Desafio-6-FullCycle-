@@ -121,12 +121,47 @@ para reconstruir e concluir o pedido sem guardar nada em memória entre o
 `input_required` e o retry. Por isso um retry sobrevive a um restart do
 processo, desde que `REQUEST_STATE_SECRET` seja o mesmo.
 
+Cada token selado também carrega um `jti` (identificador único, gerado em
+`estado_requisicao.selar`). O servidor mantém um `set` em memória dos `jti`
+já redimidos (`servidor-mcp/servidor.py:_JTIS_CONSUMIDOS`, protegido por
+`threading.Lock`) e recusa com `-32602` uma segunda apresentação do mesmo
+`requestState` — sem isso, um token válido (assinatura e TTL corretos)
+poderia ser reenviado várias vezes e produzir várias reservas a partir de um
+único conflito. Esse rastreamento é em memória pelo mesmo motivo que as
+reservas são em memória: o requisito de sobreviver a um restart é sobre a
+*validade criptográfica* do token (um retry ainda não usado antes do restart
+precisa funcionar depois), não sobre o histórico de tokens já gastos — um
+token já redimido antes de um restart poderia, em tese, ser reapresentado uma
+vez após o restart. É um risco residual aceito, coerente com a arquitetura
+100% em memória do resto do sistema.
+
 **Estado das Tasks.** Em memória, num `dict[str, Task]` dentro de
 `agente/agente.py` (classe `Estado`, com lock), igual às reservas do servidor
 MCP — não precisa sobreviver a um restart, só precisa ser visível entre
 chamadas do mesmo processo. Cada `Task` guarda sua própria `Pausa` (chave,
 `requestState`, alternativas), então duas Tasks pausadas ao mesmo tempo nunca
-compartilham ou trocam esse estado entre si.
+compartilham ou trocam esse estado entre si. Cada `Task` também tem seu
+próprio `threading.Lock` (`Task.lock`), adquirido em `_send_message` durante
+todo o tratamento de uma continuação (checagem de estado terminal, checagem
+de pausa, retry ao MCP e aplicação do resultado): sem isso, duas continuações
+`SendMessage` concorrentes na mesma Task pausada passavam ambas pela checagem
+de estado e disparavam dois retries ao MCP, e o agregado Task podia terminar
+reportando `FAILED` com o artifact de uma reserva que na verdade tinha sido
+criada com sucesso (o domínio, protegido por lock e conditional-write em
+`servidor-mcp/dominio.py:criar_reserva`, nunca duplicava a reserva em si — o
+bug era só na consistência do agregado Task do lado do agente).
+
+**Erros de transporte MCP.** `agente/mcp_cliente.py` distingue `ErroMcp` (o
+servidor MCP respondeu com um `error` JSON-RPC) de `ErroTransporteMcp`
+(conexão recusada, timeout, resposta que não é JSON válido — a chamada não
+chegou a completar). Sem essa distinção, uma falha de transporte no meio de
+uma continuação deixava a Task presa para sempre em `TASK_STATE_WORKING`
+(a transição para `WORKING` já tinha acontecido antes da chamada, e a exceção
+não tratada pulava as duas transições terminais) e a conexão HTTP do cliente
+A2A caía sem nenhuma resposta JSON-RPC. Agora ambos os tipos de erro fecham a
+Task em `TASK_STATE_FAILED` (`agente.py:_falhar_por_erro_mcp`), e um backstop
+`except Exception` em `do_POST` garante que nenhuma exceção inesperada
+derruba a conexão sem resposta.
 
 **Por que sem SDK oficial do MCP/A2A.** O enunciado descreve uma revisão do
 MCP (`2026-07-28`) com um primitivo de MRTR (`resultType: input_required` como
@@ -157,7 +192,7 @@ Execução mais recente, com os dois processos recém-iniciados
 (`python3 validador/validar.py --agente http://localhost:7300 --mcp http://localhost:7301`):
 
 ```
-trace-id desta execucao: 82868575abe4c09aa424b420f89a7771
+trace-id desta execucao: fa4f5764055f3d29d504089a8b035c6f
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools

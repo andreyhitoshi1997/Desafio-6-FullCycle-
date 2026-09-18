@@ -15,11 +15,24 @@ CAPABILITIES_ELICITATION_FORM = {"elicitation": {"form": {}}}
 
 
 class ErroMcp(Exception):
+    """Erro de protocolo: o servidor MCP respondeu com um objeto `error` JSON-RPC."""
+
     def __init__(self, code: int, message: str, data: dict | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.data = data or {}
+
+
+class ErroTransporteMcp(Exception):
+    """Falha de transporte ao falar com o servidor MCP: conexao recusada, timeout,
+    queda no meio do voo, ou corpo de resposta que nao e JSON valido. Distinto de
+    ErroMcp porque aqui o servidor nao chegou a responder um JSON-RPC - nao ha
+    `error` para interpretar, so a chamada que nao completou."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 class ClienteMcp:
@@ -56,7 +69,14 @@ class ClienteMcp:
                 bruto = r.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             bruto = e.read().decode("utf-8")
-        resposta = json.loads(bruto)
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            # Conexao recusada, servidor caiu no meio do voo, timeout de 30s etc.
+            # Nunca deixamos essa excecao de urllib subir crua para o chamador A2A.
+            raise ErroTransporteMcp(f"falha de transporte chamando {metodo} no servidor MCP: {e}") from e
+        try:
+            resposta = json.loads(bruto)
+        except json.JSONDecodeError as e:
+            raise ErroTransporteMcp(f"resposta do servidor MCP para {metodo} nao e JSON valido: {e}") from e
         if "error" in resposta:
             erro = resposta["error"]
             raise ErroMcp(erro.get("code", -32000), erro.get("message", ""), erro.get("data"))

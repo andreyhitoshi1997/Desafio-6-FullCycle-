@@ -28,7 +28,7 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from mcp_cliente import ClienteMcp, ErroMcp
+from mcp_cliente import ClienteMcp, ErroMcp, ErroTransporteMcp
 
 AGENT_HOST = os.environ.get("AGENT_HOST", "0.0.0.0")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "7300"))
@@ -66,6 +66,10 @@ class Task:
         self.artifacts: list[dict] = []
         self.pausa: Pausa | None = None
         self.trace_id: str | None = None
+        # Serializa toda mutacao desta Task: duas continuacoes SendMessage
+        # concorrentes no mesmo taskId nao podem ambas passar da checagem de
+        # estado terminal/pausa e disparar dois retries MCP para a mesma Task.
+        self.lock = threading.Lock()
 
     def registrar_trace(self, traceparent: str | None) -> None:
         if traceparent and self.trace_id is None:
@@ -200,17 +204,28 @@ def _avancar_apos_chamada_mcp(task: Task, resultado: dict) -> None:
     task.history.append(msg)
 
 
+def _falhar_por_erro_mcp(task: Task, e: ErroMcp | ErroTransporteMcp) -> None:
+    """Fecha a Task em FAILED (estado terminal) diante de qualquer erro ao falar
+    com o MCP - de protocolo (ErroMcp) ou de transporte (ErroTransporteMcp, ex.:
+    servidor MCP fora do ar, timeout, conexao caindo no meio do voo). Sem isso,
+    uma excecao nao tratada deixaria a Task presa em WORKING para sempre, e a
+    conexao HTTP do cliente A2A cairia sem nenhuma resposta JSON-RPC."""
+    prefixo = "Erro de protocolo MCP" if isinstance(e, ErroMcp) else "Erro de transporte falando com o servidor MCP"
+    task.pausa = None
+    task.state = "TASK_STATE_FAILED"
+    msg = _mensagem("ROLE_AGENT", f"{prefixo}: {e.message}", task.id, task.contextId)
+    task.status_message = msg
+    task.history.append(msg)
+
+
 def _iniciar_reserva(task: Task, pedido: dict, traceparent: str | None) -> None:
     task.state = "TASK_STATE_WORKING"
     try:
         resultado = MCP.reservar_sala(
             pedido["sala"], pedido["inicio"], pedido["fim"], pedido["responsavel"], task.novo_traceparent()
         )
-    except ErroMcp as e:
-        task.state = "TASK_STATE_FAILED"
-        msg = _mensagem("ROLE_AGENT", f"Erro de protocolo MCP: {e.message}", task.id, task.contextId)
-        task.status_message = msg
-        task.history.append(msg)
+    except (ErroMcp, ErroTransporteMcp) as e:
+        _falhar_por_erro_mcp(task, e)
         return
     _avancar_apos_chamada_mcp(task, resultado)
 
@@ -235,11 +250,8 @@ def _continuar_reserva(task: Task, escolha: str) -> None:
     try:
         # Retry com id de JSON-RPC novo (garantido por ClienteMcp/secrets.token_hex a cada chamada).
         resultado = MCP.retomar_reservar_sala(pausa.chave, acao, pausa.request_state, task.novo_traceparent())
-    except ErroMcp as e:
-        task.state = "TASK_STATE_FAILED"
-        msg = _mensagem("ROLE_AGENT", f"Erro de protocolo MCP: {e.message}", task.id, task.contextId)
-        task.status_message = msg
-        task.history.append(msg)
+    except (ErroMcp, ErroTransporteMcp) as e:
+        _falhar_por_erro_mcp(task, e)
         return
     if escolha == "recusar":
         # action=decline conclui com resultType complete e reservado=false; a Task
@@ -273,16 +285,21 @@ def _send_message(params: dict, traceparent: str | None) -> dict:
         task = ESTADO.obter(task_id)
         if task is None:
             raise ErroA2a(-32001, f"Task nao encontrada: {task_id}")
-        if task.state in TERMINAIS:
-            raise ErroA2a(-32002, f"Task {task_id} ja esta em estado terminal ({task.state})")
-        task.registrar_trace(traceparent)
-        task.history.append(_mensagem("ROLE_USER", texto, task.id, task.contextId))
+        # Todo o ciclo (checagem de estado terminal, checagem de pausa, retry
+        # MCP e aplicacao do resultado) roda sob o lock da Task: uma segunda
+        # continuacao concorrente so adquire o lock depois que a primeira ja
+        # terminou de mutar o estado, e entao encontra a Task ja terminal.
+        with task.lock:
+            if task.state in TERMINAIS:
+                raise ErroA2a(-32002, f"Task {task_id} ja esta em estado terminal ({task.state})")
+            task.registrar_trace(traceparent)
+            task.history.append(_mensagem("ROLE_USER", texto, task.id, task.contextId))
 
-        casamento = RE_ESCOLHA.match(texto.strip())
-        if not casamento or task.pausa is None:
-            raise ErroA2a(-32003, "Continuacao esperada no formato escolha=<valor>")
-        _continuar_reserva(task, casamento.group("valor"))
-        return {"task": task.como_dict()}
+            casamento = RE_ESCOLHA.match(texto.strip())
+            if not casamento or task.pausa is None:
+                raise ErroA2a(-32003, "Continuacao esperada no formato escolha=<valor>")
+            _continuar_reserva(task, casamento.group("valor"))
+            return {"task": task.como_dict()}
 
     task = ESTADO.criar_task()
     task.registrar_trace(traceparent)
@@ -384,6 +401,12 @@ class Handler(BaseHTTPRequestHandler):
             self._responder(200, {"jsonrpc": "2.0", "id": rpc_id, "result": resultado})
         except ErroA2a as e:
             self._responder(200, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": e.code, "message": e.message}})
+        except Exception as e:
+            # Backstop: uma excecao nao prevista nunca pode derrubar a conexao
+            # sem resposta JSON-RPC nenhuma (isso deixaria o cliente A2A sem
+            # confirmacao alguma do que aconteceu com a Task).
+            print(f"[agente] erro nao tratado em {metodo}: {e}", file=sys.stderr, flush=True)
+            self._responder(200, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32603, "message": f"erro interno: {e}"}})
 
     def _responder(self, status: int, corpo: dict) -> None:
         dados = json.dumps(corpo).encode("utf-8")

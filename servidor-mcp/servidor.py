@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 
@@ -49,6 +50,22 @@ SEGREDO = None  # preenchido em main(), lido uma vez
 
 
 CENTRAL = dominio.CentralDeSalas()
+
+# jti (identificador unico) de cada requestState ja redimido (accept ou decline),
+# para recusar um segundo uso do mesmo token: sem isso, um requestState valido
+# (assinatura e TTL corretos) poderia ser reenviado varias vezes e produzir
+# varias reservas a partir de um unico conflito. Em memoria, protegido por lock
+# porque ThreadingHTTPServer atende cada conexao numa thread propria.
+_JTIS_CONSUMIDOS: set[str] = set()
+_LOCK_JTIS = threading.Lock()
+
+
+def _redimir_jti(jti: str) -> None:
+    """Marca um requestState como usado; levanta ErroProtocolo se ja tinha sido."""
+    with _LOCK_JTIS:
+        if jti in _JTIS_CONSUMIDOS:
+            raise ErroProtocolo(-32602, "requestState ja foi utilizado (replay detectado)")
+        _JTIS_CONSUMIDOS.add(jti)
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +333,12 @@ def _handle_reservar_sala_retry(params: dict) -> dict:
     except estado.EstadoInvalido as e:
         raise ErroProtocolo(-32602, f"requestState invalido: {e}") from e
 
+    # Token criptograficamente valido: agora redime o jti. Um segundo tools/call
+    # com este mesmo requestState (replay) e recusado a partir daqui, mesmo que
+    # a assinatura e o TTL continuem validos - previne dupla reserva a partir de
+    # um unico conflito.
+    _redimir_jti(payload.get("jti", token))
+
     chave = payload.get("key", CHAVE_ELICITATION)
     respostas = params.get("inputResponses") or {}
     resposta = respostas.get(chave) or next(iter(respostas.values()), None)
@@ -430,11 +453,15 @@ def despachar(corpo: dict, headers) -> tuple[int, dict]:
     metodo = corpo.get("method")
     params = corpo.get("params") or {}
 
+    # Logado antes de qualquer validacao: um request rejeitado por _meta ausente
+    # ou header divergente precisa aparecer no stderr tanto quanto um aceito -
+    # e exatamente o tipo de request que mais se quer ver ao depurar a ponte.
+    traceparent = (params.get("_meta") or {}).get("traceparent", "-")
+    print(f"[mcp] method={metodo} id={rpc_id} traceparent={traceparent}", file=sys.stderr, flush=True)
+
     try:
         meta = _validar_meta(params)
         _validar_headers(headers, metodo, params, meta)
-        traceparent = meta.get("traceparent", "-")
-        print(f"[mcp] method={metodo} id={rpc_id} traceparent={traceparent}", file=sys.stderr, flush=True)
 
         if metodo == "tools/list":
             resultado = {

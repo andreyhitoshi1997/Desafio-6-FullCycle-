@@ -9,6 +9,13 @@ REQUEST_STATE_SECRET seja o mesmo.
 Formato: "v1." + base64url(payload_json) + base64url(hmac_sha256)[43 chars fixos].
 Qualquer byte adulterado no meio muda o HMAC recomputado e falha a verificacao
 com hmac.compare_digest (comparacao em tempo constante).
+
+Cada token carrega um "jti" (identificador unico, gerado em `selar`) que o
+servidor usa para recusar um segundo redeem do mesmo requestState (replay):
+ver o conjunto `_JTIS_CONSUMIDOS` em servidor.py. Esse rastreamento e em
+memoria, pelo mesmo motivo que as reservas sao em memoria - o unico dado que
+precisa sobreviver a um restart e a validade criptografica do token (assinatura
++ TTL), nao o registro de quais tokens ja foram gastos antes do restart.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import time
 
 PREFIXO = "v1."
@@ -43,6 +51,9 @@ def selar(payload: dict, segredo: bytes, ttl_segundos: int = TTL_PADRAO_SEGUNDOS
     corpo = dict(payload)
     corpo["iat"] = int(time.time())
     corpo["exp"] = corpo["iat"] + ttl_segundos
+    # jti = identificador unico do token, usado pelo servidor para recusar um
+    # segundo redeem do mesmo requestState (replay), mesmo com assinatura valida.
+    corpo["jti"] = secrets.token_hex(16)
     payload_bruto = json.dumps(corpo, separators=(",", ":"), sort_keys=True).encode("utf-8")
     payload_b64 = _b64_sem_padding(payload_bruto)
     assinatura = hmac.new(segredo, (PREFIXO + payload_b64).encode("ascii"), hashlib.sha256).digest()
@@ -61,7 +72,7 @@ def abrir(token: str, segredo: bytes) -> dict:
     assinatura_b64 = corpo[-TAMANHO_ASSINATURA_B64:]
     try:
         assinatura_recebida = _b64_decode(assinatura_b64)
-    except (ValueError, UnicodeDecodeError, Exception) as e:  # base64.binascii.Error entra aqui
+    except Exception as e:  # base64.binascii.Error, ValueError etc. entram aqui
         raise EstadoInvalido(f"assinatura do requestState mal formada: {e}") from e
     assinatura_esperada = hmac.new(segredo, (PREFIXO + payload_b64).encode("ascii"), hashlib.sha256).digest()
     if not hmac.compare_digest(assinatura_recebida, assinatura_esperada):
