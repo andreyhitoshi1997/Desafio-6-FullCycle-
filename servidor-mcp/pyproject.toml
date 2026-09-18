@@ -1,0 +1,11 @@
+[project]
+name = "servidor-mcp"
+version = "1.0.0"
+description = "Servidor MCP (Streamable HTTP, revisao 2026-07-28) da Central de Salas - Hill Valley Tech"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.entrega]
+# Sem dependencias externas de proposito: ver README.md, secao "Decisoes tecnicas",
+# sobre a divergencia entre este desafio e o SDK oficial do MCP disponivel.
+python-pinned = "3.10"

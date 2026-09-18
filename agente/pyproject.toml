@@ -1,0 +1,10 @@
+[project]
+name = "agente"
+version = "1.0.0"
+description = "Agente Central de Salas: host MCP por dentro, servidor A2A por fora"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.entrega]
+# Sem dependencias externas, sem SDK de LLM. Caminho de execucao 100% determinístico.
+python-pinned = "3.10"
